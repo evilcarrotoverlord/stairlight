@@ -1,0 +1,16 @@
+# PHASE 1 (testing): one momentary push button between GPIO33 and GND.
+# A press = trigger from the bottom (bottom -> top).
+binary_sensor:
+  - platform: gpio
+    id: trigger_button
+    name: "Trigger Button (GPIO33)"
+    pin:
+      number: GPIO33
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - lambda: |-
+          stair::engine().trigger(stair::DIR_UP, millis());
