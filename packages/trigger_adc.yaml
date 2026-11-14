@@ -1,0 +1,32 @@
+# PHASE 2: two contact sensors/buttons on GPIO33, told apart by voltage (ADC1_CH5).
+#   Wiring: 10k pull-up from GPIO33 to 3.3 V.
+#     Bottom sensor: contact straight to GND            (~0 V)  -> bottom -> top
+#     Top sensor:    contact via 4.7k resistor to GND    (~1 V)  -> top -> bottom
+#   Idle reads ~3.1 V (ADC saturates just below 3.3 V).
+substitutions:
+  adc_bottom_max: "0.3"   # V: below this = bottom sensor
+  adc_top_min: "0.6"      # V: top sensor band
+  adc_top_max: "1.6"
+  adc_idle_min: "2.5"     # V: above this = idle
+  adc_samples: "3"        # consecutive 20 ms samples needed (debounce)
+
+esphome:
+  on_boot:
+    priority: 500
+    then:
+      - lambda: |-
+          stair::decoder().configure(${adc_bottom_max}, ${adc_top_min}, ${adc_top_max}, ${adc_idle_min}, ${adc_samples});
+
+sensor:
+  - platform: adc
+    id: trigger_adc
+    pin: GPIO33
+    attenuation: 12db
+    update_interval: 20ms
+    internal: true            # keep it off the web page (it would flood the event stream)
+    on_value:
+      - lambda: |-
+          int ev = stair::decoder().feed(x);
+          if (ev == 1) stair::engine().trigger(stair::DIR_UP, millis());
+          else if (ev == 2) stair::engine().trigger(stair::DIR_DOWN, millis());
+          
