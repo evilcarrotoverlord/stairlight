@@ -1,9 +1,10 @@
 # Stairlight - ESP32-WROOM-32E N4 on a DOMRAEM ESP32 addressable LED controller, WS2815 strip.
 substitutions:
   name: stairlight
-  # Compile-time LED capacity. 3072 = 32 steps x 96 LEDs (full range) but only ~10 fps at the limit.
-  # 1024 gives ~30 fps and still allows e.g. 32x32, 21x48 or 13x78. Steps x LEDs above this is clamped.
-  max_leds: "3072"
+  # Compile-time LED capacity = how many LEDs are transmitted on every frame (~30 us each, per strip).
+  # 512 (~15 ms/frame) allows e.g. 13x39, 21x24, 32x16 and is the most robust against flicker.
+  # 3072 = full 32x96 range but ~92 ms per frame. Steps x LEDs above this is clamped (see Status).
+  max_leds: "512"
   relay_inverted: "false"     # set "true" if the DOMRAEM relay is active-low
 
 esphome:
@@ -20,11 +21,9 @@ esphome:
       - light.turn_on:
           id: strip_main
           brightness: 100%
-          effect: "Stair Engine"
       - light.turn_on:
           id: strip_backup
           brightness: 100%
-          effect: "Stair Engine"
 
 esp32:
   board: esp32dev
@@ -47,7 +46,6 @@ wifi:
 ota:
   - platform: esphome
     password: !secret ota_password
-  - platform: web_server
 
 web_server:
   port: 80
@@ -77,7 +75,8 @@ switch:
     internal: true
 
 light:
-  # Primary data line (DI) and backup data line (BI): both get the identical frame.
+  # Primary data line (DI) and backup data line (BI): both get the identical frame, written directly
+  # from the interval below (no ESPHome effect: effects re-send every frame, which causes flicker).
   - platform: esp32_rmt_led_strip
     id: strip_main
     pin: GPIO16
@@ -87,14 +86,7 @@ light:
     default_transition_length: 0s
     gamma_correct: 1.0
     restore_mode: ALWAYS_OFF
-    use_psram: false
     internal: true
-    effects:
-      - addressable_lambda:
-          name: "Stair Engine"
-          update_interval: 16ms
-          lambda: |-
-            stair::copy_frame(it, millis());
   - platform: esp32_rmt_led_strip
     id: strip_backup
     pin: GPIO2                  # strapping pin; unplug BI when flashing over serial if it fails
@@ -104,14 +96,7 @@ light:
     default_transition_length: 0s
     gamma_correct: 1.0
     restore_mode: ALWAYS_OFF
-    use_psram: false
     internal: true
-    effects:
-      - addressable_lambda:
-          name: "Stair Engine"
-          update_interval: 16ms
-          lambda: |-
-            stair::copy_frame(it, millis());
 
   # Colour picker: drives no hardware, only stores the colour the animations use.
   - platform: rgb
@@ -276,6 +261,12 @@ interval:
           s.color.b = (uint8_t) (cv.get_blue() * br * 255.0f + 0.5f);
           e.apply_settings(s, now);
           e.tick(now);
+          e.render(now);
+          if (stair::pusher().should_send(e.frame(), e.state(), now)) {
+            auto *a = static_cast<esphome::light::AddressableLight *>(id(strip_main).get_output());
+            auto *b = static_cast<esphome::light::AddressableLight *>(id(strip_backup).get_output());
+            stair::write_frame(*a, *b, e.frame());
+          }
 
           bool want = e.relay_actual();
           if (id(relay_out).state != want) {

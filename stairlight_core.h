@@ -285,4 +285,31 @@ class TriggerDecoder {
   bool armed_ = false;
 };
 
+// ---- frame pushing policy --------------------------------------------------------------------
+// Decides WHEN a frame is sent to the strips. Sending continuously (even unchanged frames) keeps the
+// RMT peripheral and the Wi-Fi interrupts fighting and corrupts data (random coloured flicker), so:
+//  * send only when the picture changed (at most every MIN_SEND_INTERVAL_MS),
+//  * while powered (any state but IDLE) refresh every KEEPALIVE_MS to repair any corrupted pixel,
+//  * send nothing while idle.
+constexpr uint32_t MIN_SEND_INTERVAL_MS = 20;
+constexpr uint32_t KEEPALIVE_MS = 250;
+
+class FramePusher {
+ public:
+  bool should_send(const std::vector<Rgb> &frame, State st, uint32_t now) {
+    if (have_ && (uint32_t) (now - last_send_) < MIN_SEND_INTERVAL_MS) return false;
+    bool changed = !have_ || frame != last_;
+    bool keepalive = st != ST_IDLE && (uint32_t) (now - last_send_) >= KEEPALIVE_MS;
+    if (!changed && !keepalive) return false;
+    last_ = frame;
+    last_send_ = now;
+    have_ = true;
+    return true;
+  }
+ private:
+  std::vector<Rgb> last_;
+  uint32_t last_send_ = 0;
+  bool have_ = false;
+};
+
 }  // namespace stair

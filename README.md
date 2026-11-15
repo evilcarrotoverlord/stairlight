@@ -1,5 +1,10 @@
 # Stairlight (ESPHome, ESP32-WROOM-32E N4, WS2815)
 
+## v2 changes
+- **Flicker fix:** v1 used an ESPHome light effect, which re-sends a frame every 16 ms even when nothing changed, and each send blocks the main loop. Both strips were transmitting almost continuously, which corrupts WS281x data next to Wi-Fi. Now frames are written directly and sent only when the picture changes (max every 20 ms), with a 250 ms refresh while lit and nothing at all while idle (`FramePusher` in `stairlight_core.h`, unit-tested).
+- **LED capacity:** `max_leds` default is now 512 (about 15 ms per frame instead of ~92 ms). Raise it in `stairlight.yaml` if you need more than 512 LEDs; steps x LEDs above the cap is clamped and shown in Status.
+- **No web login.** The web-page OTA upload was removed with it (it would have been open to anyone on the network). OTA via ESPHome still needs the OTA password.
+
 ## Status of this build (v1)
 - Engine logic (`stairlight_core.h`): complete, unit-tested on a PC (`tests/run.sh`, ~250k checks), cross-compiles with the Xtensa ESP32 toolchain.
 - ESPHome config: validates with `esphome config` (ESPHome 2026.10.2) for both trigger variants.
@@ -17,7 +22,7 @@ Strapping pins: GPIO12 must be LOW at reset (check the board's relay driver), GP
 If the relay is active-low set `relay_inverted: "true"`.
 
 ## Network
-`http://stairlight.local` (user `admin`, password `stair1234`). If `Root-Network` is unreachable the board starts AP `stairlight` (pass `stair1234`); open `http://192.168.4.1`. mDNS may not resolve in AP mode. OTA also works from the web page.
+`http://stairlight.local` (no login). If `Root-Network` is unreachable the board starts AP `stairlight` (pass `stair1234`); open `http://192.168.4.1`. mDNS may not resolve in AP mode. OTA also works from the web page.
 
 ## Web page
 Configuration: Animation Mode, Steps (1-32, def 13), LEDs per Step (1-96, def 21), Linger Time (def 10 s), Color.
@@ -29,10 +34,13 @@ Changing mode/steps/LEDs while running aborts the animation. A colour change app
 Strip starts at the BOTTOM step, left to right (">"), next step right to left ("<"), etc. If yours starts at the top, change `pixel_index()` in `stairlight_core.h` (one function).
 
 ## LED capacity vs frame rate
-`max_leds` (compile-time) defaults to 3072 = 32x96, about 10 fps at that size. 1024 gives ~30 fps. Steps x LEDs above `max_leds` is clamped and shown in Status.
+`max_leds` (compile-time) defaults to 512 (~15 ms per frame). 1024 = ~31 ms, 3072 (full 32x96) = ~92 ms per frame. Steps x LEDs above `max_leds` is clamped and shown in Status.
 
 ## Phase 2 (two sensors, one pin)
 Swap the package line in `stairlight.yaml` to `trigger_adc.yaml`. Wire a 10k pull-up from GPIO33 to 3.3 V; bottom sensor = contact to GND; top sensor = contact to GND through ~4.7k. Tune the `adc_*` substitutions after reading the voltages in the log.
+
+## If it still flickers
+It is then most likely electrical: WS2815 data input expects a logic-high above roughly 3.5 V, and the ESP32 outputs 3.3 V. Check the board's level shifter, keep the data wire short, add a ~330 ohm series resistor near the first LED, and share ground between controller and strip power supply.
 
 ## Behaviour summary
 Trigger -> relay on, 250 ms settle -> intro in trigger direction -> hold for Linger -> outro (same order/direction, erasing) -> relay off after 500 ms.
