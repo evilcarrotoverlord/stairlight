@@ -53,10 +53,6 @@ web_server:
   port: 80
   version: 3
   local: true               # serve the UI from the device itself (no CDN) - required for AP mode
-  auth:
-    type: digest
-    username: admin
-    password: !secret web_password
   sorting_groups:
     - id: grp_config
       name: "Configuration"
@@ -91,6 +87,7 @@ light:
     default_transition_length: 0s
     gamma_correct: 1.0
     restore_mode: ALWAYS_OFF
+    use_psram: false
     internal: true
     effects:
       - addressable_lambda:
@@ -107,6 +104,7 @@ light:
     default_transition_length: 0s
     gamma_correct: 1.0
     restore_mode: ALWAYS_OFF
+    use_psram: false
     internal: true
     effects:
       - addressable_lambda:
