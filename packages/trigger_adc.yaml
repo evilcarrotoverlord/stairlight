@@ -29,4 +29,3 @@ sensor:
           int ev = stair::decoder().feed(x);
           if (ev == 1) stair::engine().trigger(stair::DIR_UP, millis());
           else if (ev == 2) stair::engine().trigger(stair::DIR_DOWN, millis());
-          
