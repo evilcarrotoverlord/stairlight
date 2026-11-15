@@ -15,8 +15,9 @@ struct Rgb {
 enum Mode : int { MODE_ROLL = 0, MODE_INWARD = 1, MODE_FALL = 2, MODE_SERPENT = 3 };
 enum Dir : int { DIR_UP = 0, DIR_DOWN = 1 };  // UP = triggered from bottom, DOWN = triggered from top
 enum State : int {
-  ST_IDLE, ST_RELAY_WAIT, ST_INTRO, ST_HOLD, ST_OUTRO, ST_RELAY_OFF_WAIT, ST_TEST_WAIT, ST_TEST_HOLD
+  ST_IDLE, ST_RELAY_WAIT, ST_INTRO, ST_HOLD, ST_OUTRO, ST_RELAY_OFF_WAIT, ST_TEST_WAIT, ST_TEST_HOLD, ST_DIAG
 };
+enum DiagKind : int { DIAG_NONE, DIAG_RELAY, DIAG_DATA };
 
 constexpr int MAX_STEPS = 32;
 constexpr int MAX_LEDS_PER_STEP = 96;
@@ -24,6 +25,8 @@ constexpr uint32_t RELAY_SETTLE_MS = 250;      // relay on -> first frame
 constexpr uint32_t RELAY_OFF_DELAY_MS = 500;   // last frame -> relay off
 constexpr uint32_t RELAY_OVERRIDE_MS = 5000;   // manual relay toggle duration
 constexpr uint8_t TEST_WHITE_LEVEL = 128;      // 50 % white in test pattern
+constexpr uint32_t DIAG_RELAY_PHASE_MS = 8000;  // diagnostic: relay OFF / ON / OFF, 8 s each
+constexpr uint32_t DIAG_DATA_PHASE_MS = 15000;  // diagnostic: data pin HIGH, relay OFF then ON, 15 s each
 
 inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -115,7 +118,7 @@ class Engine {
     linger_ms_ = in.linger_ms < 1000 ? 1000 : in.linger_ms;
     have_settings_ = true;
     // Geometry/mode changed mid-run: abort to black, relay follows its normal off-delay.
-    if (changed && busy()) enter(ST_RELAY_OFF_WAIT, now);
+    if (changed && busy() && state_ != ST_DIAG) enter(ST_RELAY_OFF_WAIT, now);
   }
 
   void trigger(Dir d, uint32_t now) {
@@ -127,6 +130,7 @@ class Engine {
       case ST_OUTRO: enter(ST_HOLD, now); break;     // cancel outro, fresh linger
       case ST_TEST_HOLD: dir_ = d; start_intro(now); break;
       case ST_TEST_WAIT: dir_ = d; enter(ST_RELAY_WAIT, now); break;
+      case ST_DIAG: break;  // diagnostics are exclusive
     }
   }
 
@@ -135,12 +139,29 @@ class Engine {
       case ST_TEST_WAIT: case ST_TEST_HOLD: enter(ST_RELAY_OFF_WAIT, now); break;  // toggle off
       case ST_IDLE: relay_on_ = true; enter(ST_TEST_WAIT, now); break;
       case ST_RELAY_WAIT: enter(ST_TEST_WAIT, now); break;
+      case ST_DIAG: break;
       default: enter(ST_TEST_HOLD, now); break;  // relay already on and settled
     }
   }
 
+  // ---- hardware diagnostics (web-panel buttons) ----------------------------------------------
+  // DIAG_RELAY: strip power OFF 8 s, ON 8 s, OFF 8 s (measure the V+ terminal).
+  // DIAG_DATA : GPIO16 held HIGH (LED driver detached), relay OFF 15 s then ON 15 s (measure DATA),
+  //             then the glue reboots the controller to hand GPIO16 back to the LED driver.
+  void start_diag(DiagKind k, uint32_t now) {
+    diag_kind_ = k;
+    reboot_needed_ = false;
+    override_active_ = false;
+    relay_on_ = false;
+    enter(ST_DIAG, now);
+  }
+  void cancel_diag(uint32_t now) { if (state_ == ST_DIAG) end_diag(now); }
+  bool diag_data_hold() const { return state_ == ST_DIAG && diag_kind_ == DIAG_DATA; }
+  bool diag_reboot_needed() const { return reboot_needed_; }
+  DiagKind diag_kind() const { return diag_kind_; }
+
   void relay_override(uint32_t now) {
-    if (override_active_) return;  // second press during the window is ignored
+    if (override_active_ || state_ == ST_DIAG) return;  // second press during the window is ignored
     override_active_ = true;
     override_until_ = now + RELAY_OVERRIDE_MS;
   }
@@ -156,6 +177,14 @@ class Engine {
       case ST_RELAY_OFF_WAIT: if (el >= RELAY_OFF_DELAY_MS) { relay_on_ = false; enter(ST_IDLE, now); } break;
       case ST_TEST_WAIT: if (el >= RELAY_SETTLE_MS) enter(ST_TEST_HOLD, now); break;
       case ST_TEST_HOLD: if (el >= linger_ms_) enter(ST_RELAY_OFF_WAIT, now); break;
+      case ST_DIAG: {
+        uint32_t phase_ms = diag_kind_ == DIAG_RELAY ? DIAG_RELAY_PHASE_MS : DIAG_DATA_PHASE_MS;
+        uint32_t phases = diag_kind_ == DIAG_RELAY ? 3 : 2;
+        uint32_t ph = el / phase_ms;
+        if (ph >= phases) end_diag(now);
+        else relay_on_ = (ph == 1);
+        break;
+      }
       default: break;
     }
   }
@@ -190,9 +219,27 @@ class Engine {
   bool clamped() const { return clamped_; }
   uint32_t duration() const { return dur_; }
 
+  // Like status(), but with live diagnostic phase/countdown text.
+  std::string status_at(uint32_t now) const {
+    if (state_ != ST_DIAG) return status();
+    bool relay_diag = diag_kind_ == DIAG_RELAY;
+    uint32_t phase_ms = relay_diag ? DIAG_RELAY_PHASE_MS : DIAG_DATA_PHASE_MS;
+    uint32_t phases = relay_diag ? 3 : 2;
+    uint32_t el = now - t_state_;
+    uint32_t ph = el / phase_ms;
+    if (ph >= phases) ph = phases - 1;
+    uint32_t left = (phase_ms - (el - ph * phase_ms) + 999) / 1000;
+    std::string st = (ph == 1) ? "ON" : "OFF";
+    std::string t = std::to_string(left) + " s left";
+    if (relay_diag)
+      return "Diagnostic relay " + std::to_string(ph + 1) + "/3: strip power " + st + " - measure V+ terminal (" + t + ")";
+    return "Diagnostic data " + std::to_string(ph + 1) + "/2: GPIO16 HIGH, strip power " + st +
+           " - measure DATA terminal (" + t + "), then reboot";
+  }
+
   std::string status() const {
     static const char *names[] = {"Idle", "Relay settling", "Playing", "Lingering", "Fading out",
-                                  "Relay off delay", "Test: relay settling", "Test pattern"};
+                                  "Relay off delay", "Test: relay settling", "Test pattern", "Diagnostic"};
     std::string s = names[state_];
     if (clamped_) s += " (clamped to " + std::to_string(S_) + "x" + std::to_string(L_) + ")";
     return s;
@@ -200,6 +247,12 @@ class Engine {
 
  private:
   void enter(State s, uint32_t now) { state_ = s; t_state_ = now; }
+  void end_diag(uint32_t now) {
+    if (diag_kind_ == DIAG_DATA) reboot_needed_ = true;  // GPIO16 was detached from the LED driver
+    diag_kind_ = DIAG_NONE;
+    relay_on_ = false;
+    enter(ST_IDLE, now);
+  }
   void start_intro(uint32_t now) {
     dur_ = duration_ms(mode_, dir_, S_, L_);
     enter(ST_INTRO, now);
@@ -256,7 +309,8 @@ class Engine {
   bool have_settings_ = false, clamped_ = false;
   State state_ = ST_IDLE;
   uint32_t t_state_ = 0, dur_ = 0, last_render_ = 0, override_until_ = 0;
-  bool have_render_ = false, relay_on_ = false, override_active_ = false;
+  bool have_render_ = false, relay_on_ = false, override_active_ = false, reboot_needed_ = false;
+  DiagKind diag_kind_ = DIAG_NONE;
 };
 
 // ---- GPIO33 trigger decoding (phase 2: two contact sensors on one ADC pin) ---------------------

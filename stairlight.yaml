@@ -5,7 +5,6 @@ substitutions:
   # 512 (~15 ms/frame) allows e.g. 13x39, 21x24, 32x16 and is the most robust against flicker.
   # 3072 = full 32x96 range but ~92 ms per frame. Steps x LEDs above this is clamped (see Status).
   max_leds: "512"
-  relay_inverted: "false"     # set "true" if the DOMRAEM relay is active-low
 
 esphome:
   name: ${name}
@@ -21,15 +20,16 @@ esphome:
       - light.turn_on:
           id: strip_main
           brightness: 100%
-      - light.turn_on:
-          id: strip_backup
-          brightness: 100%
 
 esp32:
   board: esp32dev
   flash_size: 4MB
   framework:
     type: esp-idf
+    sdkconfig_options:
+      # Let the RMT TX interrupt keep running while flash is written (settings saves etc.).
+      # Without this, a flash write stalls the LED signal mid-frame = corrupted pixels.
+      CONFIG_RMT_TX_ISR_CACHE_SAFE: "y"
 
 logger:
 
@@ -39,6 +39,7 @@ packages:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  power_save_mode: none     # steadier interrupt timing for the LED signal
   ap:                       # fallback access point, web page at http://192.168.4.1
     ssid: stairlight
     password: !secret ap_password
@@ -61,6 +62,9 @@ web_server:
     - id: grp_status
       name: "Status"
       sorting_weight: -10
+    - id: grp_diag
+      name: "Diagnostics"
+      sorting_weight: 0
 
 # ---------------------------------------------------------------------------------------------
 # Hardware
@@ -70,34 +74,23 @@ switch:
     id: relay_out
     pin:
       number: GPIO12            # strapping pin: must be LOW at reset. Verify the board's relay driver.
-      inverted: ${relay_inverted}
     restore_mode: ALWAYS_OFF
     internal: true
 
 light:
-  # Primary data line (DI) and backup data line (BI): both get the identical frame, written directly
-  # from the interval below (no ESPHome effect: effects re-send every frame, which causes flicker).
+  # LED data on GPIO16 (DOM-WLE-AM default output, level-shifted on the board). Frames are written
+  # directly from the interval below (no ESPHome effect: effects re-send every frame, which causes flicker).
   - platform: esp32_rmt_led_strip
     id: strip_main
     pin: GPIO16
     num_leds: ${max_leds}
     channel_colors: GRB
     chipset: WS2812
+    rmt_symbols: 384          # bigger RMT buffer = more tolerance to Wi-Fi interrupt latency (max 512 with one strip)
     default_transition_length: 0s
     gamma_correct: 1.0
     restore_mode: ALWAYS_OFF
     internal: true
-  - platform: esp32_rmt_led_strip
-    id: strip_backup
-    pin: GPIO2                  # strapping pin; unplug BI when flashing over serial if it fails
-    num_leds: ${max_leds}
-    channel_colors: GRB
-    chipset: WS2812
-    default_transition_length: 0s
-    gamma_correct: 1.0
-    restore_mode: ALWAYS_OFF
-    internal: true
-
   # Colour picker: drives no hardware, only stores the colour the animations use.
   - platform: rgb
     id: stair_color
@@ -225,6 +218,25 @@ button:
     on_press:
       - lambda: |-
           stair::engine().relay_override(millis());
+  # ---- Diagnostics (hardware checks, measure with a multimeter) --------------------------------
+  - platform: template
+    name: "Diagnose Relay GPIO12 (strip power off 8s, on 8s, off 8s)"
+    web_server: {sorting_group_id: grp_diag, sorting_weight: 10}
+    on_press:
+      - lambda: |-
+          stair::engine().start_diag(stair::DIAG_RELAY, millis());
+  - platform: template
+    name: "Diagnose Data GPIO16 (held HIGH 30s, then reboot)"
+    web_server: {sorting_group_id: grp_diag, sorting_weight: 20}
+    on_press:
+      - lambda: |-
+          stair::engine().start_diag(stair::DIAG_DATA, millis());
+  - platform: template
+    name: "Cancel Diagnostic"
+    web_server: {sorting_group_id: grp_diag, sorting_weight: 30}
+    on_press:
+      - lambda: |-
+          stair::engine().cancel_diag(millis());
 
 binary_sensor:
   - platform: template
@@ -264,8 +276,7 @@ interval:
           e.render(now);
           if (stair::pusher().should_send(e.frame(), e.state(), now)) {
             auto *a = static_cast<esphome::light::AddressableLight *>(id(strip_main).get_output());
-            auto *b = static_cast<esphome::light::AddressableLight *>(id(strip_backup).get_output());
-            stair::write_frame(*a, *b, e.frame());
+            stair::write_frame(*a, e.frame());
           }
 
           bool want = e.relay_actual();
@@ -284,8 +295,18 @@ interval:
             call.perform();
           }
 
+          // Data-pin diagnostic: hold GPIO16 HIGH; when it ends (or is cancelled) reboot to restore the LED driver.
+          static bool data_held = false;
+          if (e.diag_data_hold()) {
+            stair::hold_data_pin_high();
+            data_held = true;
+          } else if (data_held || e.diag_reboot_needed()) {
+            data_held = false;
+            App.safe_reboot();
+          }
+
           static std::string last_status;
-          std::string st = e.status();
+          std::string st = e.status_at(now);
           if (st != last_status) {
             last_status = st;
             id(status_text).publish_state(st);
